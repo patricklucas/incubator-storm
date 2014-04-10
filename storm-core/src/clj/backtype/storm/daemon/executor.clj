@@ -595,7 +595,7 @@
   (let [execute-sampler (mk-stats-sampler (:storm-conf executor-data))
         executor-stats (:stats executor-data)
         {:keys [storm-conf component-id worker-context transfer-fn report-error sampler
-                open-or-prepare-was-called?]} executor-data
+                stream->component->grouper open-or-prepare-was-called?]} executor-data
         rand (Random. (Utils/secureRandomLong))
         tuple-action-fn (fn [task-id ^TupleImpl tuple]
                           ;; synchronization needs to be done with a key provided by this bolt, otherwise:
@@ -692,48 +692,53 @@
                     (OutputCollector.
                      (reify IOutputCollector
                        (emit [this stream anchors values]
-                         (bolt-emit stream anchors values nil))
+                         (locking stream->component->grouper
+                           (bolt-emit stream anchors values nil)))
                        (emitDirect [this task stream anchors values]
-                         (bolt-emit stream anchors values task))
+                         (locking stream->component->grouper
+                           (bolt-emit stream anchors values task)))
                        (^void ack [this ^Tuple tuple]
-                         (let [^TupleImpl tuple tuple
-                               ack-val (.getAckVal tuple)]
-                           (fast-map-iter [[root id] (.. tuple getMessageId getAnchorsToIds)]
-                                          (task/send-unanchored task-data
-                                                                ACKER-ACK-STREAM-ID
-                                                                [root (bit-xor id ack-val)])
-                                          ))
-                         (let [delta (tuple-time-delta! tuple)]
-                           (task/apply-hooks user-context .boltAck (BoltAckInfo. tuple task-id delta))
-                           (when delta
-                             (builtin-metrics/bolt-acked-tuple! (:builtin-metrics task-data)
-                                                                executor-stats
-                                                                (.getSourceComponent tuple)                                                      
-                                                                (.getSourceStreamId tuple)
-                                                                delta)
-                             (stats/bolt-acked-tuple! executor-stats
-                                                      (.getSourceComponent tuple)
-                                                      (.getSourceStreamId tuple)
-                                                      delta))))
+                         (locking stream->component->grouper
+                           (let [^TupleImpl tuple tuple
+                                 ack-val (.getAckVal tuple)]
+                             (fast-map-iter [[root id] (.. tuple getMessageId getAnchorsToIds)]
+                                            (task/send-unanchored task-data
+                                                                  ACKER-ACK-STREAM-ID
+                                                                  [root (bit-xor id ack-val)])
+                                            ))
+                           (let [delta (tuple-time-delta! tuple)]
+                             (task/apply-hooks user-context .boltAck (BoltAckInfo. tuple task-id delta))
+                             (when delta
+                               (builtin-metrics/bolt-acked-tuple! (:builtin-metrics task-data)
+                                                                  executor-stats
+                                                                  (.getSourceComponent tuple)
+                                                                  (.getSourceStreamId tuple)
+                                                                  delta)
+                               (stats/bolt-acked-tuple! executor-stats
+                                                        (.getSourceComponent tuple)
+                                                        (.getSourceStreamId tuple)
+                                                        delta)))))
                        (^void fail [this ^Tuple tuple]
-                         (fast-list-iter [root (.. tuple getMessageId getAnchors)]
-                                         (task/send-unanchored task-data
-                                                               ACKER-FAIL-STREAM-ID
-                                                               [root]))
-                         (let [delta (tuple-time-delta! tuple)]
-                           (task/apply-hooks user-context .boltFail (BoltFailInfo. tuple task-id delta))
-                           (when delta
-                             (builtin-metrics/bolt-failed-tuple! (:builtin-metrics task-data)
-                                                                 executor-stats
-                                                                 (.getSourceComponent tuple)                                                      
-                                                                 (.getSourceStreamId tuple))
-                             (stats/bolt-failed-tuple! executor-stats
-                                                       (.getSourceComponent tuple)
-                                                       (.getSourceStreamId tuple)
-                                                       delta))))
+                         (locking stream->component->grouper
+                           (fast-list-iter [root (.. tuple getMessageId getAnchors)]
+                                           (task/send-unanchored task-data
+                                                                 ACKER-FAIL-STREAM-ID
+                                                                 [root]))
+                           (let [delta (tuple-time-delta! tuple)]
+                             (task/apply-hooks user-context .boltFail (BoltFailInfo. tuple task-id delta))
+                             (when delta
+                               (builtin-metrics/bolt-failed-tuple! (:builtin-metrics task-data)
+                                                                   executor-stats
+                                                                   (.getSourceComponent tuple)
+                                                                   (.getSourceStreamId tuple))
+                               (stats/bolt-failed-tuple! executor-stats
+                                                         (.getSourceComponent tuple)
+                                                         (.getSourceStreamId tuple)
+                                                         delta)))))
                        (reportError [this error]
-                         (report-error error)
-                         )))))
+                         (locking stream->component->grouper
+                           (report-error error)
+                         ))))))
         (reset! open-or-prepare-was-called? true)        
         (log-message "Prepared bolt " component-id ":" (keys task-datas))
         (setup-metrics! executor-data)
